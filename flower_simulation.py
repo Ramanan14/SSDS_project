@@ -32,7 +32,7 @@ parser.add_argument(
 parser.add_argument(
     "--num_rounds",
     type=int,
-    default=5,
+    default=15,  # ← Changed default to 15 rounds per increment
     help="Number of federated rounds per increment",
 )
 parser.add_argument(
@@ -60,6 +60,7 @@ beta_ewc = 100.0
 
 # ----------------------------
 # 3) Model Definition
+# (ResNet-32 backbone)
 # ----------------------------
 def conv3x3(in_c, out_c, stride=1):
     return nn.Conv2d(in_c, out_c, 3, stride, padding=1, bias=False)
@@ -149,11 +150,10 @@ tasks = [all_classes[i*classes_per_inc:(i+1)*classes_per_inc] for i in range(num
 
 def get_loader(idxs: List[int], train: bool = True) -> DataLoader:
     ds = full_train if train else full_test
-    subset = Subset(ds, idxs)
-    return DataLoader(subset, batch_size, shuffle=train)
+    return DataLoader(Subset(ds, idxs), batch_size, shuffle=train)
 
 # ----------------------------
-# 5) CL Helpers
+# 5) CL Helpers (EWC, LwF)
 # ----------------------------
 def compute_fisher(model: nn.Module, loader: DataLoader) -> Dict[str, torch.Tensor]:
     model.eval()
@@ -252,18 +252,25 @@ class CILClient(fl.client.NumPyClient):
                 pred = self.model(x.to(device)).argmax(1)
                 correct += (pred == y.to(device)).sum().item()
                 total += y.size(0)
-        loss = float(F.cross_entropy(self.model(x.to(device)), y.to(device)))
-        return loss, total, {"accuracy": correct / total}
+        return 0.0, total, {"accuracy": correct / total}
 
 # ----------------------------
 # 7) Simulation Loop
 # ----------------------------
 if __name__ == "__main__":
     results = []
-    client_splits = create_iid_splits() if args.agg_method != "noniid" else create_noniid_splits(dirichlet_alpha)
+    client_splits = (
+        create_iid_splits()
+        if args.agg_method != "noniid"
+        else create_noniid_splits(dirichlet_alpha)
+    )
+
     for inc in range(num_increments):
         seen = sum(tasks[: inc + 1], [])
-        train_idxs = [[i for i in idxs if full_train.targets[i] in seen] for idxs in client_splits]
+        train_idxs = [
+            [i for i in idxs if full_train.targets[i] in seen]
+            for idxs in client_splits
+        ]
         test_idxs = [i for i, t in enumerate(full_test.targets) if t in seen]
 
         # Strategy selection
@@ -286,6 +293,7 @@ if __name__ == "__main__":
             )
         elif args.agg_method == "scaffold":
             from flwr.server.strategy import SCAFFOLD
+
             strategy = SCAFFOLD(
                 fraction_fit=1.0,
                 fraction_eval=1.0,
@@ -294,6 +302,7 @@ if __name__ == "__main__":
                 min_available_clients=num_clients,
             )
         else:
+            # GLFC uses FedAvg backbone
             strategy = fl.server.strategy.FedAvg(
                 fraction_fit=1.0,
                 fraction_eval=1.0,
@@ -312,6 +321,7 @@ if __name__ == "__main__":
                 cl_method=args.cl_method,
             )
 
+        # Run 15 federated rounds per increment
         hist = fl.simulation.start_simulation(
             client_fn=client_fn,
             num_clients=num_clients,
@@ -319,7 +329,8 @@ if __name__ == "__main__":
             strategy=strategy,
         )
 
-        print(f"Increment {inc+1} accuracy: {hist.metrics_centralized['accuracy']}")
-        results.append(hist.metrics_centralized["accuracy"])
+        acc = hist.metrics_centralized["accuracy"]
+        print(f"Increment {inc+1} (15 rounds) → global accuracy: {acc}")
+        results.append(acc)
 
     print("Final per-increment accuracies:", results)
